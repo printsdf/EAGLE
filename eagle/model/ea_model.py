@@ -206,6 +206,7 @@ class EaModel(nn.Module):
             max_length=2048,
             log=False,
             is_llama3=False,
+            audit_state=None,
 
     ):
         if is_llama3:
@@ -241,6 +242,8 @@ class EaModel(nn.Module):
             self.current_length_data = current_length_data
 
         input_len = input_ids.shape[1]
+        if audit_state is not None:
+            audit_state.setdefault("prompt_token_count", int(input_len))
         reset_tree_mode(self)
         # prefill
         draft_tokens, retrieve_indices, tree_mask, tree_position_ids, logits, hidden_state, sample_token = initialize_tree(
@@ -266,9 +269,14 @@ class EaModel(nn.Module):
             # logits = logits[0, retrieve_indices]
             draft_tokens = torch.cat((draft_tokens, padding), dim=1)
             candidates = draft_tokens[0, retrieve_indices]
+            if audit_state is not None:
+                audit_state["step_index"] = int(idx)
+                audit_state["input_token_count"] = int(input_ids.shape[1])
+                audit_state["candidate_count"] = int(candidates.shape[0])
+                audit_state["candidate_length"] = int(candidates.shape[1])
             # verification
             best_candidate, accept_length, sample_p = evaluate_posterior(
-                logits, candidates, logits_processor
+                logits, candidates, logits_processor, audit_state=audit_state
             )
             # print(accept_length)
             # Adjusting the input sequence, draft model forward

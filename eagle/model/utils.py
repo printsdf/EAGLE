@@ -2,7 +2,7 @@ import copy
 import random
 
 # typing 
-from typing import List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import time
 import torch
 
@@ -334,85 +334,198 @@ def tree_decoding(
 
 
 
+def _candidate_prefix_to_list(candidate_row: torch.Tensor, length: int) -> List[int]:
+    tokens = candidate_row[:length].detach().cpu().tolist()
+    return [int(token) for token in tokens if int(token) >= 0]
+
+
+def _clean_candidate_list(candidate_row: torch.Tensor) -> List[int]:
+    tokens = candidate_row.detach().cpu().tolist()
+    return [int(token) for token in tokens if int(token) >= 0]
+
+
+def _compute_token_rank(probs: torch.Tensor, token_id: Optional[int]) -> Optional[int]:
+    if token_id is None or token_id < 0:
+        return None
+    return int((probs > probs[token_id]).sum().item()) + 1
+
+
+def _append_audit_record(audit_state: Optional[Dict[str, Any]], record: Dict[str, Any]) -> None:
+    if audit_state is None:
+        return
+
+    merged_record: Dict[str, Any] = {}
+    for key, value in audit_state.items():
+        if key in {"records", "callback"}:
+            continue
+        merged_record[key] = copy.deepcopy(value)
+
+    merged_record.update(record)
+
+    callback = audit_state.get("callback")
+    if callback is not None:
+        callback(copy.deepcopy(merged_record))
+
+    audit_state.setdefault("records", []).append(merged_record)
+
+
 def evaluate_posterior(
         logits: torch.Tensor,
         candidates: torch.Tensor,
         logits_processor,
+        audit_state: Optional[Dict[str, Any]] = None,
 ):
     """
     Evaluate the posterior probabilities of the candidates based on the provided logits and choose the best candidate.
 
     Depending on the temperature value, the function either uses greedy decoding or evaluates posterior
     probabilities to select the best candidate.
-
-    Args:
-    - logits (torch.Tensor): Predicted logits of shape (batch_size, sequence_length, vocab_size).
-    - candidates (torch.Tensor): Candidate token sequences.
-    - temperature (float): Softmax temperature for probability scaling. A value of 0 indicates greedy decoding.
-    - posterior_threshold (float): Threshold for posterior probability.
-    - posterior_alpha (float): Scaling factor for the threshold.
-
-    Returns:
-    - best_candidate (torch.Tensor): Index of the chosen best candidate.
-    - accept_length (int): Length of the accepted candidate sequence.
     """
-    # Greedy decoding based on temperature value
     if logits_processor is None:
-        # Find the tokens that match the maximum logits for each position in the sequence
         posterior_mask = (
                 candidates[:, 1:].to(logits.device) == torch.argmax(logits[:, :-1], dim=-1)
         ).int()
         candidates_accept_length = (torch.cumprod(posterior_mask, dim=1)).sum(dim=1)
         accept_length = candidates_accept_length.max()
-        # Choose the best candidate
         if accept_length == 0:
-            # Default to the first candidate if none are accepted
             best_candidate = torch.tensor(0, dtype=torch.long, device=candidates.device)
         else:
             best_candidate = torch.argmax(candidates_accept_length).to(torch.long)
-        return best_candidate, accept_length, logits[best_candidate, accept_length]
 
+        best_candidate_idx = int(best_candidate.item())
+        accept_length_int = int(accept_length.item()) if isinstance(accept_length, torch.Tensor) else int(accept_length)
+        sample_logits = logits[best_candidate_idx, accept_length_int]
+
+        if audit_state is not None:
+            probs = torch.softmax(sample_logits, dim=-1)
+            topk = min(5, probs.shape[-1])
+            topk_probs, topk_ids = torch.topk(probs, k=topk)
+            candidate_row = candidates[best_candidate_idx]
+            reject_position = accept_length_int + 1
+            first_rejected_token_id: Optional[int] = None
+            candidate_rank: Optional[int] = None
+            strict_reject = False
+            if reject_position < candidates.shape[1]:
+                candidate_token = int(candidate_row[reject_position].item())
+                if candidate_token >= 0:
+                    first_rejected_token_id = candidate_token
+                    candidate_rank = _compute_token_rank(probs, candidate_token)
+                    strict_reject = candidate_token != int(topk_ids[0].item())
+                else:
+                    reject_position = None
+            else:
+                reject_position = None
+
+            entropy = float((-(probs * torch.log(probs.clamp_min(1e-12))).sum()).item())
+            margin = float((topk_probs[0] - topk_probs[1]).item()) if topk > 1 else None
+            _append_audit_record(
+                audit_state,
+                {
+                    "verification_mode": "greedy",
+                    "best_candidate_index": best_candidate_idx,
+                    "accept_length": accept_length_int,
+                    "accepted_token_count": accept_length_int + 1,
+                    "candidate_token_ids": _clean_candidate_list(candidate_row),
+                    "accepted_token_ids": _candidate_prefix_to_list(candidate_row, accept_length_int + 1),
+                    "per_candidate_accept_length": [int(x) for x in candidates_accept_length.detach().cpu().tolist()],
+                    "first_rejected_position": reject_position,
+                    "first_rejected_token_id": first_rejected_token_id,
+                    "target_distribution_index": accept_length_int,
+                    "target_top1_token_id": int(topk_ids[0].item()),
+                    "target_top1_prob": float(topk_probs[0].item()),
+                    "target_topk_token_ids": [int(x) for x in topk_ids.detach().cpu().tolist()],
+                    "target_topk_probs": [float(x) for x in topk_probs.detach().cpu().tolist()],
+                    "candidate_rank": candidate_rank,
+                    "entropy": entropy,
+                    "margin_top1_top2": margin,
+                    "strict_reject": strict_reject,
+                },
+            )
+        return best_candidate, accept_length, sample_logits
+
+    accept_length = 1
+    accept_cand = candidates[0][:1]
+    best_candidate = 0
+    adjustflag = False
+    for i in range(1, candidates.shape[1]):
+        if i != accept_length:
+            break
+        is_eq = (candidates[:, :accept_length] == accept_cand).all(dim=1)
+        fi = torch.nonzero(is_eq, as_tuple=True)[0][0]
+        gt_logits = logits[fi, i - 1][None]
+        gt_logits = logits_processor(None, gt_logits)[0]
+        gtp = torch.softmax(gt_logits, dim=0)
+        candidates_set = []
+        for j in range(candidates.shape[0]):
+            if is_eq[j]:
+                x = candidates[j, i]
+                xi = x.item()
+                if xi in candidates_set or xi == -1:
+                    continue
+                candidates_set.append(xi)
+                r = random.random()
+                px = gtp[xi]
+                qx = 1.0
+                acp = px / qx
+                if r <= acp:
+                    accept_cand = torch.cat((accept_cand, x[None]), dim=0)
+                    accept_length += 1
+                    best_candidate = j
+                    break
+                gtp[xi] = 0
+                gtp = gtp / gtp.sum()
+                adjustflag = True
+    if adjustflag and accept_length != candidates.shape[1]:
+        sample_p = gtp
     else:
-        accept_length = 1
-        accept_cand = candidates[0][:1]
-        best_candidate = 0
-        for i in range(1, candidates.shape[1]):
-            if i != accept_length:
-                break
-            adjustflag = False
-            is_eq = (candidates[:, :accept_length] == accept_cand).all(dim=1)
-            fi = torch.nonzero(is_eq, as_tuple=True)[0][0]
-            gt_logits = logits[fi, i - 1][None]
-            gt_logits = logits_processor(None, gt_logits)[0]
-            gtp = torch.softmax(gt_logits, dim=0)
-            candidates_set = []
-            for j in range(candidates.shape[0]):
-                if is_eq[j]:
-                    x = candidates[j, i]
-                    xi = x.item()
-                    if xi in candidates_set or xi == -1:
-                        continue
-                    candidates_set.append(xi)
-                    r = random.random()
-                    px = gtp[xi]
-                    qx = 1.0
-                    acp = px / qx
-                    if r <= acp:
-                        accept_cand = torch.cat((accept_cand, x[None]), dim=0)
-                        accept_length += 1
-                        best_candidate = j
-                        break
-                    else:
-                        gtp[xi] = 0
-                        gtp = gtp / gtp.sum()
-                        adjustflag = True
-        if adjustflag and accept_length != candidates.shape[1]:
-            sample_p = gtp
+        gt_logits = logits[best_candidate, accept_length - 1][None]
+        gt_logits = logits_processor(None, gt_logits)[0]
+        sample_p = torch.softmax(gt_logits, dim=0)
+
+    if audit_state is not None:
+        best_candidate_idx = int(best_candidate)
+        accept_length_int = int(accept_length - 1)
+        topk = min(5, sample_p.shape[-1])
+        topk_probs, topk_ids = torch.topk(sample_p, k=topk)
+        candidate_row = candidates[best_candidate_idx]
+        reject_position = accept_length_int + 1
+        first_rejected_token_id: Optional[int] = None
+        candidate_rank: Optional[int] = None
+        if reject_position < candidates.shape[1]:
+            candidate_token = int(candidate_row[reject_position].item())
+            if candidate_token >= 0:
+                first_rejected_token_id = candidate_token
+                candidate_rank = _compute_token_rank(sample_p, candidate_token)
+            else:
+                reject_position = None
         else:
-            gt_logits = logits[best_candidate, accept_length - 1][None]
-            gt_logits = logits_processor(None, gt_logits)[0]
-            sample_p = torch.softmax(gt_logits, dim=0)
-        return torch.tensor(best_candidate), accept_length - 1, sample_p
+            reject_position = None
+
+        entropy = float((-(sample_p * torch.log(sample_p.clamp_min(1e-12))).sum()).item())
+        margin = float((topk_probs[0] - topk_probs[1]).item()) if topk > 1 else None
+        _append_audit_record(
+            audit_state,
+            {
+                "verification_mode": "sampled",
+                "best_candidate_index": best_candidate_idx,
+                "accept_length": accept_length_int,
+                "accepted_token_count": accept_length_int + 1,
+                "candidate_token_ids": _clean_candidate_list(candidate_row),
+                "accepted_token_ids": _candidate_prefix_to_list(candidate_row, accept_length_int + 1),
+                "first_rejected_position": reject_position,
+                "first_rejected_token_id": first_rejected_token_id,
+                "target_distribution_index": accept_length_int,
+                "target_top1_token_id": int(topk_ids[0].item()),
+                "target_top1_prob": float(topk_probs[0].item()),
+                "target_topk_token_ids": [int(x) for x in topk_ids.detach().cpu().tolist()],
+                "target_topk_probs": [float(x) for x in topk_probs.detach().cpu().tolist()],
+                "candidate_rank": candidate_rank,
+                "entropy": entropy,
+                "margin_top1_top2": margin,
+                "strict_reject": None,
+            },
+        )
+    return torch.tensor(best_candidate), accept_length - 1, sample_p
 
 
 @torch.no_grad()
