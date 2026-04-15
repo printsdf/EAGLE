@@ -185,6 +185,7 @@ class EaModel(nn.Module):
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
                 position_ids=position_ids,
+                output_hidden_states=self.use_eagle3,
             )
             if output_orig:
                 orig = self.base_model.lm_head(outputs[0])
