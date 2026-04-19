@@ -35,6 +35,7 @@ class EaModel(nn.Module):
             top_k,
             threshold,
             ea_layer_state_dict,
+            local_files_only=False,
     ):
 
         super().__init__()
@@ -43,7 +44,11 @@ class EaModel(nn.Module):
         self.hidden_size = base_model.lm_head.weight.shape[-1]
         self.vocab_size = base_model.lm_head.weight.shape[0]
         self.base_model_name_or_path = base_model_name_or_path
-        self.tokenizer = AutoTokenizer.from_pretrained(self.base_model_name_or_path, use_fast=False)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.base_model_name_or_path,
+            use_fast=False,
+            local_files_only=local_files_only,
+        )
         self.use_eagle3 = use_eagle3
         config = EConfig.from_pretrained(ea_model_path)
         with open(ea_model_path, "r") as f:
@@ -54,10 +59,12 @@ class EaModel(nn.Module):
             bias = True
         if use_eagle3:
             self.ea_layer = Model(config, bias=bias, total_tokens=total_token, depth=depth, top_k=top_k,
-                                  threshold=threshold, path=base_model_name_or_path,load_emb=True)
+                                  threshold=threshold, path=base_model_name_or_path, load_emb=True,
+                                  local_files_only=local_files_only)
         else:
             self.ea_layer = Model1(config, bias=bias, total_tokens=total_token, depth=depth, top_k=top_k,
-                                  threshold=threshold, path=base_model_name_or_path,load_emb=True)
+                                  threshold=threshold, path=base_model_name_or_path, load_emb=True,
+                                  local_files_only=local_files_only)
 
         low_memory = False
 
@@ -95,10 +102,18 @@ class EaModel(nn.Module):
             depth=7,
             top_k=10,
             threshold=1.0,
+            local_files_only=False,
             **kwargs,
     ):
+        kwargs = dict(kwargs)
+        kwargs.setdefault("local_files_only", local_files_only)
+        local_files_only = bool(kwargs["local_files_only"])
+
         # assert Type=="LLaMA" or "Mixtral"
-        Type = AutoConfig.from_pretrained(base_model_path).architectures[0]
+        Type = AutoConfig.from_pretrained(
+            base_model_path,
+            local_files_only=local_files_only,
+        ).architectures[0]
 
         if Type == 'LlamaForCausalLM':
             base_model = KVLlamaForCausalLM.from_pretrained(
@@ -119,19 +134,31 @@ class EaModel(nn.Module):
 
         configpath = os.path.join(ea_model_path, "config.json")
         if not os.path.exists(configpath):
-            configpath = hf_hub_download(ea_model_path, "config.json")
+            configpath = hf_hub_download(
+                ea_model_path,
+                "config.json",
+                local_files_only=local_files_only,
+            )
 
         try:
             load_model_path = os.path.join(ea_model_path, "pytorch_model.bin")
             if not os.path.exists(load_model_path):
-                load_model_path = hf_hub_download(ea_model_path, "pytorch_model.bin")
+                load_model_path = hf_hub_download(
+                    ea_model_path,
+                    "pytorch_model.bin",
+                    local_files_only=local_files_only,
+                )
             ea_layer_state_dict = torch.load(load_model_path,
                                              map_location=base_model.device)
         except:
             from safetensors.torch import load_file
             load_model_path = os.path.join(ea_model_path, "model.safetensors")
             if not os.path.exists(load_model_path):
-                load_model_path = hf_hub_download(ea_model_path, "model.safetensors")
+                load_model_path = hf_hub_download(
+                    ea_model_path,
+                    "model.safetensors",
+                    local_files_only=local_files_only,
+                )
             ea_layer_state_dict = load_file(load_model_path)
         model = cls(
             use_eagle3,
@@ -142,7 +169,8 @@ class EaModel(nn.Module):
             depth,
             top_k,
             threshold,
-            ea_layer_state_dict
+            ea_layer_state_dict,
+            local_files_only=local_files_only,
         )
 
         if total_token == -1:

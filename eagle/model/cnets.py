@@ -476,7 +476,18 @@ def len_list(x, n):
 
 
 class Model(nn.Module):
-    def __init__(self, config, load_emb=False, path=None, bias=True, total_tokens=63, depth=5, top_k=8, threshold=1.0):
+    def __init__(
+        self,
+        config,
+        load_emb=False,
+        path=None,
+        bias=True,
+        total_tokens=63,
+        depth=5,
+        top_k=8,
+        threshold=1.0,
+        local_files_only=False,
+    ):
         super().__init__()
         self.config=config
         self.gradient_checkpointing = True
@@ -491,13 +502,21 @@ class Model(nn.Module):
             try:
                 index_json_path = os.path.join(path, "model.safetensors.index.json")
                 if not os.path.exists(index_json_path):
-                    index_json_path = hf_hub_download(path, "model.safetensors.index.json")
+                    index_json_path = hf_hub_download(
+                        path,
+                        "model.safetensors.index.json",
+                        local_files_only=local_files_only,
+                    )
                 with open(index_json_path, "r") as f:
                     index_json = json.loads(f.read())
                     emb_path = index_json["weight_map"]["model.embed_tokens.weight"]
                 local_emb_path = os.path.join(path, emb_path)
                 if not os.path.exists(local_emb_path):
-                    local_emb_path = hf_hub_download(path, emb_path)
+                    local_emb_path = hf_hub_download(
+                        path,
+                        emb_path,
+                        local_files_only=local_files_only,
+                    )
                 with safe_open(local_emb_path,
                                framework="pt",
                                device="cpu") as f:
@@ -507,13 +526,21 @@ class Model(nn.Module):
             except:
                 index_json_path = os.path.join(path, "pytorch_model.bin.index.json")
                 if not os.path.exists(index_json_path):
-                    index_json_path = hf_hub_download(path, "pytorch_model.bin.index.json")
+                    index_json_path = hf_hub_download(
+                        path,
+                        "pytorch_model.bin.index.json",
+                        local_files_only=local_files_only,
+                    )
                 with open(index_json_path, "r") as f:
                     index_json = json.loads(f.read())
                     emb_path = index_json["weight_map"]["model.embed_tokens.weight"]
                 local_emb_path = os.path.join(path, emb_path)
                 if not os.path.exists(local_emb_path):
-                    local_emb_path = hf_hub_download(path, emb_path)
+                    local_emb_path = hf_hub_download(
+                        path,
+                        emb_path,
+                        local_files_only=local_files_only,
+                    )
                 weights = torch.load(local_emb_path)
                 tensor = weights["model.embed_tokens.weight"].float()
             self.embed_tokens.weight.data = tensor
