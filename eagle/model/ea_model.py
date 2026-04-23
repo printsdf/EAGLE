@@ -187,6 +187,14 @@ class EaModel(nn.Module):
                 position_ids=position_ids,
                 output_hidden_states=self.use_eagle3,
             )
+            if self.use_eagle3:
+                raw_hidden_states = getattr(outputs, "hidden_states", None)
+                if raw_hidden_states is None or len(raw_hidden_states) < 3:
+                    raise RuntimeError(
+                        "EAGLE3 tree init requires at least 3 hidden-state tensors."
+                    )
+                outputs["hidden_states"] = tuple(raw_hidden_states[:3])
+                outputs.hidden_states = outputs["hidden_states"]
             if output_orig:
                 orig = self.base_model.lm_head(outputs[0])
             hidden_states = outputs[0]
