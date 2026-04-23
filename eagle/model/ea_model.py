@@ -45,6 +45,12 @@ class EaModel(nn.Module):
         self.base_model_name_or_path = base_model_name_or_path
         self.tokenizer = AutoTokenizer.from_pretrained(self.base_model_name_or_path, use_fast=False)
         self.use_eagle3 = use_eagle3
+        self.eagle3_hidden_state_indices = None
+        if self.use_eagle3 and hasattr(base_model, "model") and hasattr(base_model.model, "layers"):
+            self.eagle3_hidden_state_indices = default_eagle3_hidden_state_indices(
+                len(base_model.model.layers)
+            )
+            base_model.model._eagle3_hidden_state_indices = self.eagle3_hidden_state_indices
         config = EConfig.from_pretrained(ea_model_path)
         with open(ea_model_path, "r") as f:
             con = json.loads(f.read())
@@ -189,11 +195,10 @@ class EaModel(nn.Module):
             )
             if self.use_eagle3:
                 raw_hidden_states = getattr(outputs, "hidden_states", None)
-                if raw_hidden_states is None or len(raw_hidden_states) < 3:
-                    raise RuntimeError(
-                        "EAGLE3 tree init requires at least 3 hidden-state tensors."
-                    )
-                outputs["hidden_states"] = tuple(raw_hidden_states[:3])
+                outputs["hidden_states"] = select_eagle3_hidden_states(
+                    raw_hidden_states,
+                    layer_indices=self.eagle3_hidden_state_indices,
+                )
                 outputs.hidden_states = outputs["hidden_states"]
             if output_orig:
                 orig = self.base_model.lm_head(outputs[0])

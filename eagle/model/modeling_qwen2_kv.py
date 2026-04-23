@@ -817,6 +817,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
+        self._eagle3_hidden_state_indices = None
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
@@ -905,13 +906,26 @@ class Qwen2Model(Qwen2PreTrainedModel):
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         # decoder layers
+        selected_hidden_state_indices = getattr(self, "_eagle3_hidden_state_indices", None)
+        collect_selected_hidden_states = (
+            output_hidden_states and selected_hidden_state_indices is not None
+        )
+        selected_hidden_state_index_set = (
+            set(int(idx) for idx in selected_hidden_state_indices)
+            if collect_selected_hidden_states
+            else set()
+        )
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
 
-        for decoder_layer in self.layers:
+        for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
-                all_hidden_states += (hidden_states,)
+                if collect_selected_hidden_states:
+                    if idx in selected_hidden_state_index_set:
+                        all_hidden_states += (hidden_states,)
+                else:
+                    all_hidden_states += (hidden_states,)
 
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
@@ -948,7 +962,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         hidden_states = self.norm(hidden_states)
 
         # add hidden states from the last decoder layer
-        if output_hidden_states:
+        if output_hidden_states and not collect_selected_hidden_states:
             all_hidden_states += (hidden_states,)
 
         next_cache = next_decoder_cache if use_cache else None

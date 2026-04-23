@@ -21,6 +21,64 @@ from transformers.generation.logits_process import (
 )
 
 
+def default_eagle3_hidden_state_indices(num_hidden_layers: int) -> Tuple[int, int, int]:
+    """Match the 3-layer target-feature selection used during EAGLE3 training."""
+    if num_hidden_layers < 3:
+        raise ValueError(
+            f"EAGLE3 requires at least 3 hidden layers, got {num_hidden_layers}."
+        )
+
+    preferred = [2, num_hidden_layers // 2, num_hidden_layers - 3]
+    indices: List[int] = []
+    for idx in preferred:
+        clamped = min(max(int(idx), 0), num_hidden_layers - 1)
+        if clamped not in indices:
+            indices.append(clamped)
+
+    if len(indices) < 3:
+        for idx in range(num_hidden_layers):
+            if idx not in indices:
+                indices.append(idx)
+            if len(indices) == 3:
+                break
+
+    return tuple(indices[:3])
+
+
+def get_eagle3_hidden_state_indices(model: Any) -> Optional[Tuple[int, ...]]:
+    if model is None:
+        return None
+
+    base_model = getattr(model, "base_model", None)
+    if base_model is not None and hasattr(base_model, "model"):
+        indices = getattr(base_model.model, "_eagle3_hidden_state_indices", None)
+        if indices is not None:
+            return tuple(int(idx) for idx in indices)
+
+    module = getattr(model, "model", None)
+    if module is not None:
+        indices = getattr(module, "_eagle3_hidden_state_indices", None)
+        if indices is not None:
+            return tuple(int(idx) for idx in indices)
+    return None
+
+
+def select_eagle3_hidden_states(
+        raw_hidden_states: Any,
+        layer_indices: Optional[Tuple[int, ...]] = None,
+) -> Tuple[torch.Tensor, ...]:
+    if raw_hidden_states is None or not isinstance(raw_hidden_states, (tuple, list)):
+        raise RuntimeError("EAGLE3 requires hidden states as a tuple/list of tensors.")
+
+    if layer_indices is not None and len(raw_hidden_states) > max(layer_indices):
+        return tuple(raw_hidden_states[idx] for idx in layer_indices)
+
+    if len(raw_hidden_states) < 3:
+        raise RuntimeError("EAGLE3 tree init requires at least 3 hidden-state tensors.")
+
+    return tuple(raw_hidden_states[:3])
+
+
 class Timer:
     def __init__(self,name):
         self.name = name
@@ -247,10 +305,10 @@ def initialize_tree(input_ids, model, past_key_values, logits_processor):
     # Clone the output hidden states
     if model.use_eagle3:
         ea_device = model.ea_layer.lm_head.weight.device
-        raw_hidden_states = outputs["hidden_states"]
-        if raw_hidden_states is None or len(raw_hidden_states) < 3:
-            raise RuntimeError("EAGLE3 tree init requires at least 3 hidden-state tensors.")
-        selected_hidden_states = tuple(raw_hidden_states[:3])
+        selected_hidden_states = select_eagle3_hidden_states(
+            outputs["hidden_states"],
+            layer_indices=get_eagle3_hidden_state_indices(model),
+        )
         if selected_hidden_states[0].device != ea_device:
             selected_hidden_states = tuple(x.to(ea_device) for x in selected_hidden_states)
         outputs["hidden_states"] = selected_hidden_states
@@ -329,10 +387,10 @@ def tree_decoding(
 
     if model.use_eagle3:
         ea_device = model.ea_layer.lm_head.weight.device
-        raw_hidden_states = outputs["hidden_states"]
-        if raw_hidden_states is None or len(raw_hidden_states) < 3:
-            raise RuntimeError("EAGLE3 tree decoding requires at least 3 hidden-state tensors.")
-        selected_hidden_states = tuple(raw_hidden_states[:3])
+        selected_hidden_states = select_eagle3_hidden_states(
+            outputs["hidden_states"],
+            layer_indices=get_eagle3_hidden_state_indices(model),
+        )
         if selected_hidden_states[0].device != ea_device:
             selected_hidden_states = tuple(x.to(ea_device) for x in selected_hidden_states)
         outputs["hidden_states"] = selected_hidden_states
