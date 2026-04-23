@@ -41,6 +41,9 @@ except ImportError:
 
 set_seed(0)
 
+ANSWER_STYLE_LABEL_ONLY = "label_only"
+ANSWER_STYLE_LABEL_RATIONALE = "label_rationale"
+
 
 def _resolve_dataset_split(requested_split: str, available_splits: Sequence[str]) -> str:
     available = list(available_splits)
@@ -91,27 +94,53 @@ def normalize_pubmedqa_label(text: str) -> Optional[str]:
     if not lowered:
         return None
 
-    patterns = (
-        r"\b(?:the answer is|answer:)\s*(yes|no|maybe)\b",
-        r"^\s*(yes|no|maybe)\b",
-        r"\b(yes|no|maybe)\b",
+    explicit_patterns = (
+        r"\b(?:final answer|the answer is|answer|label|decision)\s*[:\-]\s*(yes|no|maybe)\b",
+        r"^\s*(yes|no|maybe)\s*(?:[\s\.,;:!\?-]|$)",
     )
-    for pattern in patterns:
+    for pattern in explicit_patterns:
         match = re.search(pattern, lowered)
         if match:
             return match.group(1)
+
+    first_line = lowered.splitlines()[0].strip()
+    match = re.match(r"^(yes|no|maybe)\b", first_line)
+    if match:
+        return match.group(1)
+
+    fallback = re.search(r"\b(yes|no|maybe)\b", lowered)
+    if fallback:
+        return fallback.group(1)
     return None
 
 
-def _build_prompt(question: str, passages: Sequence[str]) -> str:
+def _build_prompt(
+    question: str,
+    passages: Sequence[str],
+    answer_style: str,
+    rationale_min_words: int,
+) -> str:
     docs = "\n".join(
         f"[Doc {idx + 1}] {passage}" for idx, passage in enumerate(passages[:5])
     )
     if docs:
         docs = f"\n\nRetrieved Documents:\n{docs}"
+
+    if answer_style == ANSWER_STYLE_LABEL_ONLY:
+        instructions = "Reply with exactly one word: yes, no, or maybe."
+    elif answer_style == ANSWER_STYLE_LABEL_RATIONALE:
+        instructions = (
+            "Reply using exactly this format:\n"
+            "Answer: yes, no, or maybe\n"
+            f"Rationale: 1-2 short sentences grounded in the retrieved documents, with at least {rationale_min_words} words total.\n"
+            "Do not omit the rationale."
+        )
+    else:
+        raise ValueError(f"Unsupported answer style: {answer_style}")
+
     return (
         "You are answering a medical question.\n"
-        "Reply with exactly one word: yes, no, or maybe.\n\n"
+        f"{instructions}\n\n"
         f"Question: {question}{docs}\n\n"
         "Answer:"
     )
@@ -258,6 +287,7 @@ def _print_mode_summary(
     *,
     mode: str,
     split: str,
+    answer_style: str,
     warmup_examples: int,
     accuracy: float,
     num_examples: int,
@@ -270,6 +300,7 @@ def _print_mode_summary(
     print(f"=== PubMedQA Summary: {mode} ===")
     print(f"Warmup examples: {warmup_examples}")
     print(f"Split: {split}")
+    print(f"Answer style: {answer_style}")
     print(f"Accuracy: {accuracy:.3f} ({num_examples} examples)")
     print(f"Avg generated tokens: {avg_generated_tokens:.2f}")
     print(f"Speed: {speed:.2f} tok/s")
@@ -299,9 +330,16 @@ def run_pubmedqa_eval(
     depth: int,
     top_k: int,
     use_eagle3: bool,
+    answer_style: str,
+    rationale_min_words: int,
     output_dir: Optional[str],
     verbose: bool,
 ) -> Dict[str, Any]:
+    if answer_style not in (ANSWER_STYLE_LABEL_ONLY, ANSWER_STYLE_LABEL_RATIONALE):
+        raise ValueError(f"Unsupported answer style: {answer_style}")
+    if rationale_min_words < 1:
+        raise ValueError("rationale_min_words must be >= 1.")
+
     dataset, resolved_split = _load_pubmedqa(split)
     samples = _iter_samples(dataset, num_samples)
     if not samples:
@@ -337,7 +375,12 @@ def run_pubmedqa_eval(
         if verbose:
             print(f"Warming up {active_mode} on {warmup_count} example(s)...")
         for item in samples[:warmup_count]:
-            prompt = _build_prompt(item["question"], item["passages"])
+            prompt = _build_prompt(
+                item["question"],
+                item["passages"],
+                answer_style,
+                rationale_min_words,
+            )
             input_ids = _build_chat_input_ids(tokenizer, prompt, device)
             _ = _decode_one(
                 model=model,
@@ -363,7 +406,12 @@ def run_pubmedqa_eval(
             os.remove(predictions_path)
 
         for idx, item in enumerate(samples):
-            prompt = _build_prompt(item["question"], item["passages"])
+            prompt = _build_prompt(
+                item["question"],
+                item["passages"],
+                answer_style,
+                rationale_min_words,
+            )
             input_ids = _build_chat_input_ids(tokenizer, prompt, device)
             result = _decode_one(
                 model=model,
@@ -386,6 +434,7 @@ def run_pubmedqa_eval(
                             {
                                 "question_id": item["question_id"],
                                 "mode": active_mode,
+                                "answer_style": answer_style,
                                 "label": item["label"],
                                 "prediction": result.prediction,
                                 "normalized_prediction": result.normalized_prediction,
@@ -420,6 +469,7 @@ def run_pubmedqa_eval(
         )
         summaries[active_mode] = {
             "split": resolved_split,
+            "answer_style": answer_style,
             "warmup_examples": warmup_count,
             "accuracy": avg_accuracy,
             "num_examples": len(samples),
@@ -434,6 +484,7 @@ def run_pubmedqa_eval(
         _print_mode_summary(
             mode=active_mode,
             split=resolved_split,
+            answer_style=answer_style,
             warmup_examples=warmup_count,
             accuracy=avg_accuracy,
             num_examples=len(samples),
@@ -450,6 +501,7 @@ def run_pubmedqa_eval(
         speedup = eagle_speed / baseline_speed if baseline_speed > 0 else 1.0
         print("=== Native Compare Summary ===")
         print(f"Split: {resolved_split}")
+        print(f"Answer style: {answer_style}")
         print(
             f"Baseline accuracy/speed: "
             f"{summaries['baseline']['accuracy']:.3f} / {baseline_speed:.2f} tok/s"
@@ -488,6 +540,12 @@ if __name__ == "__main__":
     parser.add_argument("--total-token", type=int, default=32)
     parser.add_argument("--depth", type=int, default=7)
     parser.add_argument("--top-k", type=int, default=4)
+    parser.add_argument(
+        "--answer-style",
+        choices=(ANSWER_STYLE_LABEL_ONLY, ANSWER_STYLE_LABEL_RATIONALE),
+        default=ANSWER_STYLE_LABEL_ONLY,
+    )
+    parser.add_argument("--rationale-min-words", type=int, default=20)
     parser.add_argument("--use-eagle3", action="store_true")
     parser.add_argument("--disable-eagle3", action="store_true")
     parser.add_argument("--output-dir", type=str, default=None)
@@ -511,6 +569,8 @@ if __name__ == "__main__":
         depth=args.depth,
         top_k=args.top_k,
         use_eagle3=use_eagle3,
+        answer_style=args.answer_style,
+        rationale_min_words=args.rationale_min_words,
         output_dir=args.output_dir,
         verbose=not args.quiet,
     )
