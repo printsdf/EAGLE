@@ -187,6 +187,40 @@ def _required_cache_length(model: EaModel, prompt_length: int, max_new_tokens: i
     return int(prompt_length + max_new_tokens + max(total_tokens + 16, 64))
 
 
+def _eagle_cache_capacity(model: EaModel) -> int:
+    past_key_values = getattr(model, "past_key_values", None)
+    if not isinstance(past_key_values, (list, tuple)) or not past_key_values:
+        return 0
+    first_layer = past_key_values[0]
+    if not isinstance(first_layer, (list, tuple)) or not first_layer:
+        return 0
+    first_leaf = first_layer[0]
+    data = getattr(first_leaf, "data", None)
+    if torch.is_tensor(data) and data.dim() >= 3:
+        return int(data.shape[2])
+    return 0
+
+
+def _ensure_eagle_kv_cache(model: EaModel, max_length: int) -> None:
+    existing_capacity = _eagle_cache_capacity(model)
+    if (
+        existing_capacity >= max_length
+        and hasattr(model, "past_key_values")
+        and hasattr(model, "past_key_values_data")
+        and hasattr(model, "current_length_data")
+    ):
+        model.current_length_data.zero_()
+        return
+
+    past_key_values, past_key_values_data, current_length_data = initialize_past_key_values(
+        model.base_model,
+        max_length=max_length,
+    )
+    model.past_key_values = past_key_values
+    model.past_key_values_data = past_key_values_data
+    model.current_length_data = current_length_data
+
+
 def _strip_special_tokens(text: str, tokenizer) -> str:
     cleaned = text
     for special_token in tokenizer.special_tokens_map.values():
@@ -313,6 +347,7 @@ def _native_eagenerate(
     prompt_len = int(input_ids.size(1))
     max_length = _required_cache_length(model, prompt_len, max_new_tokens)
     audit_state: Dict[str, Any] = {}
+    _ensure_eagle_kv_cache(model, max_length=max_length)
 
     _synchronize(device)
     start_time = time.perf_counter()
